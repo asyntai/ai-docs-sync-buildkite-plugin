@@ -1,0 +1,48 @@
+name: AI Docs Sync
+description: Sends the documentation in your repository to your Asyntai AI chatbot, so it answers your customers from the latest docs on every build.
+author: https://github.com/asyntai
+requirements:
+  - bash
+  - python3
+configuration:
+  properties:
+    path:
+      type: string
+      description: The file or folder to read, relative to the checkout.
+    patterns:
+      type: [string, array]
+      description: File patterns to include. A comma separated string or a list.
+      items:
+        type: string
+    exclude:
+      type: [string, array]
+      description: Patterns to skip, for example "CHANGELOG.md" or "drafts/*".
+      items:
+        type: string
+    title-prefix:
+      type: string
+      description: Text put in front of every entry title, for example "Docs / ".
+    website-id:
+      type: string
+      description: The Asyntai website to write to. Leave it out for your first website.
+    api-key-env:
+      type: string
+      description: The environment variable that holds your Asyntai API key. Default ASYNTAI_API_KEY.
+    api-key-secret:
+      type: string
+      description: The name of a Buildkite secret that holds your Asyntai API key.
+    base-url:
+      type: string
+      description: The Asyntai address. Change it only for a private install.
+    prune:
+      type: boolean
+      description: Remove entries that carry your title prefix and whose file is gone.
+    dry-run:
+      type: boolean
+      description: List the files and send nothing.
+    annotate:
+      type: boolean
+      description: Add a summary annotation to the build. Default true.
+  required:
+    - path
+  additionalProperties: false

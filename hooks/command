@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Asyntai AI Docs Sync: send the documentation in the checkout to the Asyntai
+# knowledge base. The work is done by lib/sync.py; this hook only turns the
+# plugin configuration into arguments for it.
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFIX="BUILDKITE_PLUGIN_AI_DOCS_SYNC"
+
+# A plain option: BUILDKITE_PLUGIN_AI_DOCS_SYNC_<NAME>
+option() {
+  local name="${PREFIX}_$1"
+  echo "${!name:-${2:-}}"
+}
+
+# An option that may be a string or a list. The agent passes a list as
+# <NAME>_0, <NAME>_1, ... so join those with commas; a string is kept as it is.
+list_option() {
+  local base="${PREFIX}_$1"
+  local first="${base}_0"
+  if [[ -n "${!first+x}" ]]; then
+    local joined="" i=0 item
+    while true; do
+      item="${base}_${i}"
+      [[ -n "${!item+x}" ]] || break
+      joined+="${joined:+,}${!item}"
+      i=$((i + 1))
+    done
+    echo "$joined"
+  else
+    echo "${!base:-${2:-}}"
+  fi
+}
+
+# The agent does not check options against plugin.yml, so a typo such as
+# title_prefix would be dropped without a word. Stop on any option this
+# plugin does not know.
+KNOWN="PATH PATTERNS EXCLUDE TITLE_PREFIX WEBSITE_ID API_KEY_ENV API_KEY_SECRET BASE_URL PRUNE DRY_RUN ANNOTATE"
+UNKNOWN=""
+while IFS= read -r var; do
+  name="${var#"${PREFIX}_"}"
+  case "$name" in
+    PATTERNS_[0-9]* | EXCLUDE_[0-9]*) continue ;;
+  esac
+  [[ " $KNOWN " == *" $name "* ]] || UNKNOWN+=" $(echo "$name" | tr 'A-Z_' 'a-z-')"
+done < <(compgen -e | grep "^${PREFIX}_" || true)
+if [[ -n "$UNKNOWN" ]]; then
+  echo "Error: unknown option(s):$UNKNOWN" >&2
+  echo "Known options: path, patterns, exclude, title-prefix, website-id, api-key-env, api-key-secret, base-url, prune, dry-run, annotate." >&2
+  exit 1
+fi
+
+# buildkite-agent is usually on PATH; if not, the agent tells us where it is.
+AGENT_BIN=""
+if command -v buildkite-agent >/dev/null 2>&1; then
+  AGENT_BIN="buildkite-agent"
+elif [[ -n "${BUILDKITE_BIN_PATH:-}" && -x "${BUILDKITE_BIN_PATH}/buildkite-agent" ]]; then
+  AGENT_BIN="${BUILDKITE_BIN_PATH}/buildkite-agent"
+fi
+
+DOCS_PATH="$(option PATH)"
+if [[ -z "$DOCS_PATH" ]]; then
+  echo "Error: the plugin needs a path, for example path: docs" >&2
+  exit 1
+fi
+
+PATTERNS="$(list_option PATTERNS '*.md,*.mdx,*.txt')"
+EXCLUDE="$(list_option EXCLUDE '')"
+TITLE_PREFIX="$(option TITLE_PREFIX)"
+WEBSITE_ID="$(option WEBSITE_ID)"
+BASE_URL="$(option BASE_URL 'https://asyntai.com')"
+KEY_ENV="$(option API_KEY_ENV 'ASYNTAI_API_KEY')"
+KEY_SECRET="$(option API_KEY_SECRET)"
+PRUNE="$(option PRUNE 'false')"
+DRY_RUN="$(option DRY_RUN 'false')"
+ANNOTATE="$(option ANNOTATE 'true')"
+
+# The key: a Buildkite secret when one is named, otherwise an environment
+# variable (ASYNTAI_API_KEY unless api-key-env says otherwise).
+ASYNTAI_API_KEY_VALUE=""
+if [[ -n "$KEY_SECRET" ]]; then
+  if [[ -z "$AGENT_BIN" ]]; then
+    echo "Error: api-key-secret needs the buildkite-agent command on this agent." >&2
+    exit 1
+  fi
+  if ! ASYNTAI_API_KEY_VALUE="$("$AGENT_BIN" secret get "$KEY_SECRET")"; then
+    echo "Error: could not read the Buildkite secret $KEY_SECRET." >&2
+    exit 1
+  fi
+else
+  ASYNTAI_API_KEY_VALUE="${!KEY_ENV:-}"
+fi
+
+if [[ -z "$ASYNTAI_API_KEY_VALUE" && "$DRY_RUN" != "true" ]]; then
+  if [[ -n "$KEY_SECRET" ]]; then
+    echo "Error: the Buildkite secret $KEY_SECRET is empty." >&2
+  else
+    echo "Error: the environment variable $KEY_ENV is empty." >&2
+    echo "Set it in the agent environment hook, or name a Buildkite secret with api-key-secret." >&2
+  fi
+  exit 1
+fi
+
+PYTHON_BIN=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 &&
+     "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    PYTHON_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "Error: this plugin needs Python 3 on the agent, and none was found." >&2
+  exit 1
+fi
+
+ARGS=(
+  --path "$DOCS_PATH"
+  --patterns "$PATTERNS"
+  --exclude "$EXCLUDE"
+  --title-prefix "$TITLE_PREFIX"
+  --website-id "$WEBSITE_ID"
+  --base-url "$BASE_URL"
+)
+[[ "$PRUNE" == "true" ]] && ARGS+=(--prune)
+[[ "$DRY_RUN" == "true" ]] && ARGS+=(--dry-run)
+
+echo "--- :books: Sending documentation to Asyntai"
+
+LOG_FILE="$(mktemp -t asyntai-sync-XXXXXX)"
+trap 'rm -f "$LOG_FILE"' EXIT
+
+set +e
+ASYNTAI_API_KEY="$ASYNTAI_API_KEY_VALUE" "$PYTHON_BIN" -u "$PLUGIN_DIR/lib/sync.py" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+STATUS="${PIPESTATUS[0]}"
+set -e
+
+if [[ "$ANNOTATE" == "true" && -n "$AGENT_BIN" ]]; then
+  SUMMARY="$(grep -E '^(Done\.|Dry run\.|Error:)' "$LOG_FILE" | tail -n 1 || true)"
+  if [[ -n "$SUMMARY" ]]; then
+    if [[ "$STATUS" -eq 0 ]]; then STYLE="success"; else STYLE="error"; fi
+    printf '**Asyntai AI Docs Sync:** %s\n' "$SUMMARY" |
+      "$AGENT_BIN" annotate --style "$STYLE" --context asyntai-ai-docs-sync || true
+  fi
+fi
+
+exit "$STATUS"
